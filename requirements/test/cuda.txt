@@ -75,7 +75,7 @@ azure-storage-blob==12.28.0
     # via runai-model-streamer-azure
 backoff==2.2.1
     # via -r requirements/test/cuda.in
-black==24.10.0
+black==26.5.1
     # via datamodel-code-generator
 blake3==1.0.9
     # via -r requirements/test/../common.txt

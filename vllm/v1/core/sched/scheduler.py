@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -300,6 +301,90 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        # --- SLO-aware adaptive prefill cap (output-exact: only chunk SIZE changes) ---
+        import os as _os
+        self._slo_enable = _os.environ.get("VLLM_SLO_ENABLE", "0") == "1"
+        self._slo_itl_ms = float(_os.environ.get("VLLM_SLO_ITL_MS", "40"))
+        self._slo_min_prefill = int(_os.environ.get("VLLM_SLO_MIN_PREFILL", "256"))
+        self._slo_short_len = int(_os.environ.get("VLLM_SLO_SHORT_LEN", "1024"))
+        self._slo_backlog_max = int(_os.environ.get("VLLM_SLO_BACKLOG_MAX", "48"))
+        self._slo_static = _os.environ.get("VLLM_SLO_STATIC", "0") == "1"
+        self._slo_tiers = _os.environ.get("VLLM_SLO_TIERS", "0") == "1"
+        self._slo_premium_prefix = _os.environ.get("VLLM_SLO_PREMIUM_PREFIX", "premium")
+        self._slo_sjf = _os.environ.get("VLLM_SLO_SJF", "0") == "1"
+        self._slo_sjf_defer_max = int(_os.environ.get("VLLM_SLO_SJF_DEFER_MAX", "24"))
+        # SRPT-by-max_tokens: admit short-OUTPUT requests first (min mean-JCT under
+        # queueing). Prediction-free (uses user max_tokens), output-exact (admission
+        # order only), aging-bounded. Defer a request if a much-shorter-output one waits.
+        self._slo_srpt = _os.environ.get("VLLM_SLO_SRPT", "0") == "1"
+        self._slo_srpt_mult = float(_os.environ.get("VLLM_SLO_SRPT_MULT", "2.0"))
+        self._slo_srpt_defer_max = int(_os.environ.get("VLLM_SLO_SRPT_DEFER_MAX", "24"))
+        self._slo_srpt_min = 1 << 30
+        # --- VTC: per-client Virtual-Token-Counter fair queuing (RUN49) ---
+        # Max-min TOKEN fairness across clients: track cumulative tokens SERVED per
+        # client; when admitting from the waiting queue, defer requests whose client is
+        # over-served relative to the least-served waiting client -> under-served
+        # clients admit first. Fixes FCFS starvation of a light/interactive client by a
+        # backlogged batch client (which SRPT/SJF cannot: they key on per-request SIZE,
+        # so identical-size clients still starve). Output-exact (admission ORDER only).
+        self._slo_vtc = _os.environ.get("VLLM_SLO_VTC", "0") == "1"
+        self._vtc_quantum = float(_os.environ.get("VLLM_SLO_VTC_QUANTUM", "4096"))
+        self._vtc_defer_max = int(_os.environ.get("VLLM_SLO_VTC_DEFER_MAX", "100000"))
+        self._vtc_served: dict[str, float] = {}
+        self._vtc_weights: dict[str, float] = {}  # client_key -> weight (default 1.0)
+        self._vtc_min = 0.0
+        self._vtc_multi_client = False
+        # --- CACHE-AWARE co-scheduling (RUN60): when many requests share a COLD
+        # prefix arrive together (batch-eval / RAG / best-of-N fan-out), stock vLLM
+        # prefills the shared prefix REDUNDANTLY (each request misses the not-yet-
+        # populated cache). Admit ONE pioneer to populate the shared prefix, DEFER
+        # its prefix-siblings until the pioneer has cached it -> siblings become
+        # cache hits instead of redundant prefills. Output-exact (admission order
+        # only). Signature = hash of the first _ca_sig_len prompt tokens.
+        self._slo_cache_aware = _os.environ.get("VLLM_SLO_CACHE_AWARE", "0") == "1"
+        self._ca_sig_len = int(_os.environ.get("VLLM_SLO_CA_SIG_LEN", "256"))
+        self._ca_defer_max = int(_os.environ.get("VLLM_SLO_CA_DEFER_MAX", "64"))
+        # Only co-schedule (defer siblings of) requests whose shared prefix is LARGE
+        # enough that the redundant prefill saved exceeds the deferral cost. Short
+        # prompts: parallel redundant prefill is cheaper than serializing -> no gate.
+        self._ca_min_prompt = int(_os.environ.get("VLLM_SLO_CA_MIN_PROMPT", "4096"))
+        self._ca_inflight: set[int] = set()
+        self._ca_primed: set[int] = set()
+        self._ca_waiting_sigs: set[int] = set()
+        # --- UNIFIED deadline/SLO-aware controller (RUN39): ONE cost model drives
+        # BOTH chunk-sizing (from the tightest active TBT deadline) AND admission
+        # ordering (from TTFT slack). Per-request deadlines come from request class:
+        #   interactive (TTFT-sensitive, prefix _slo_int_prefix): protect TTFT
+        #   streaming   (TBT-sensitive, all others):              protect TBT
+        # Subsumes RUN22 (TBT-only) + RUN27 (TTFT-only); on a MIXED workload it
+        # protects each class's own deadline, escaping the RUN28 global conflict.
+        self._slo_unified = _os.environ.get("VLLM_SLO_UNIFIED", "0") == "1"
+        self._slo_int_prefix = _os.environ.get("VLLM_SLO_INT_PREFIX", "int")
+        # Composition-safety: only throttle prefill (RUN22 ITL cap) when an interactive
+        # (latency-sensitive) request is present -> pure-batch load never loses
+        # throughput. Set VLLM_SLO_INT_PREFIX="" to treat ALL requests as latency-
+        # sensitive (protect everyone, original RUN22), or disable the gate to always cap.
+        self._slo_itl_int_gate = _os.environ.get("VLLM_SLO_ITL_INT_GATE", "1") == "1"
+        self._slo_int_ttft_ms = float(_os.environ.get("VLLM_SLO_INT_TTFT_MS", "400"))
+        # safety factor on the ITL target (cost-model error margin -> actually MEET
+        # the SLO instead of landing just over it).
+        self._slo_safety = float(_os.environ.get("VLLM_SLO_SAFETY", "0.9"))
+        self._slo_long_chunk = int(_os.environ.get("VLLM_SLO_LONG_CHUNK", "128"))
+        # decode-cost exponent: decode step time is SUBLINEAR in batch M (weights
+        # amortize; RUN26). exp<1 (e.g. 0.5=sqrt) models this -> avoids over-
+        # estimating decode cost at high M -> cap not over-throttled at high conc.
+        self._slo_decode_exp = float(_os.environ.get("VLLM_SLO_DECODE_EXP", "1.0"))
+        # context-aware prefill cost: the DSA indexer is super-linear in context
+        # (RUN34), so a constant pref_per_tok under-estimates a chunk's cost at long
+        # context -> ITL overshoots. Scale pref cost by the in-flight prefill context.
+        self._slo_ctx_beta = float(_os.environ.get("VLLM_SLO_CTX_BETA", "0.0"))
+        self._slo_int_waiting = 0
+        # online EMA step-time model: step_ms ~= base + dec_per_req*num_decodes + pref_per_tok*prefill_tokens
+        self._slo_base_ms = float(_os.environ.get("VLLM_SLO_BASE_MS", "8.0"))
+        self._slo_dec_per_req = float(_os.environ.get("VLLM_SLO_DEC_PER_REQ", "0.14"))  # linear basis; sqrt basis ~1.0
+        self._slo_pref_per_tok = float(_os.environ.get("VLLM_SLO_PREF_PER_TOK", "0.043"))
+        self._slo_step_cap = 1 << 30
+        self._slo_prefill_used = 0
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -440,6 +525,22 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _ca_sig(self, request: Request):
+        """Prefix signature for cache-aware co-scheduling: hash of the first
+        _ca_sig_len prompt tokens. Requests sharing a >=_ca_sig_len-token prefix
+        get the same signature. Returns None for prompts too short to group.
+        Cached on the request (computed once)."""
+        s = getattr(request, "_ca_sig_cache", -1)
+        if s != -1:
+            return s
+        toks = request.prompt_token_ids
+        if toks is None or len(toks) < self._ca_sig_len:
+            request._ca_sig_cache = None
+            return None
+        s = hash(tuple(toks[: self._ca_sig_len]))
+        request._ca_sig_cache = s
+        return s
+
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -472,6 +573,89 @@ class Scheduler(SchedulerInterface):
         if 0 < remaining < self.num_prefill_lookahead:
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
+
+    def _vtc_client_key(self, request_id):
+        # Client identity for fair queuing. Request ids look like 'cmpl-<key>-<n>'
+        # (X-Request-Id / --request-id-prefix set <key>); the trailing '-<n>' is the
+        # per-request suffix. Strip a leading 'cmpl-' then the last '-<suffix>' so all
+        # requests from one client share a key. Falls back to the whole id (=> each
+        # request its own client => VTC no-ops) if the id has no client structure.
+        s = request_id
+        if s.startswith("cmpl-"):
+            s = s[5:]
+        i = s.find("-")
+        return s[:i] if i > 0 else s
+
+    def _vtc_weight(self, key):
+        # Per-client weight for WEIGHTED max-min fairness (throughput share ∝ weight).
+        # Default 1.0 (=> unweighted VTC, identical to RUN49). Live-tunable via file.
+        return self._vtc_weights.get(key, 1.0)
+
+    def _vtc_v(self, key):
+        # Virtual time = tokens_served / weight. VTC serves the client with min v.
+        return self._vtc_served.get(key, 0.0) / self._vtc_weight(key)
+
+    def _vtc_prepare(self):
+        # Compute the weighted-service frontier (min virtual-time over waiting clients);
+        # init new clients to the frontier (lift rule, in virtual-time space) so an
+        # idle/returning client can't hoard credit. Sets _vtc_min (a VIRTUAL time) and
+        # _vtc_multi_client. Weighted: v_c = served_c / weight_c.
+        _wkeys = {self._vtc_client_key(r.request_id) for r in self.waiting}
+        _wkeys |= {self._vtc_client_key(r.request_id) for r in self.skipped_waiting}
+        _active = set(_wkeys)
+        _active |= {self._vtc_client_key(r.request_id) for r in self.running}
+        _known = [self._vtc_v(c) for c in _active if c in self._vtc_served]
+        _frontier_v = min(_known) if _known else 0.0
+        for c in _wkeys:
+            if c not in self._vtc_served:
+                # start at frontier virtual-time: served = frontier_v * weight
+                self._vtc_served[c] = _frontier_v * self._vtc_weight(c)
+        self._vtc_min = min((self._vtc_v(c) for c in _wkeys), default=0.0)
+        self._vtc_multi_client = len(_wkeys) > 1
+        if self._vtc_min > 1e12:  # keep counters bounded on a long-lived server
+            for c in list(self._vtc_served):
+                self._vtc_served[c] -= self._vtc_min * self._vtc_weight(c)
+            self._vtc_min = 0.0
+
+    def _slo_is_premium(self, request):
+        return self._slo_premium_prefix in request.request_id  # id is 'cmpl-premium-<n>'
+
+    def _slo_is_interactive(self, request):
+        # TTFT-sensitive class (unified controller). id is 'cmpl-<prefix>-<n>'.
+        return self._slo_int_prefix in request.request_id
+
+    def _slo_decode_est(self, m):
+        """Estimated decode-only step time for batch M (sublinear when exp<1)."""
+        if m <= 0:
+            return self._slo_base_ms
+        return self._slo_base_ms + self._slo_dec_per_req * (m ** self._slo_decode_exp)
+
+    def _slo_pref_eff(self):
+        """Effective per-token prefill cost, scaled up for long in-flight context
+        (DSA indexer super-linear in context) so the ITL cap holds at long ctx."""
+        pe = self._slo_pref_per_tok
+        if self._slo_ctx_beta > 0.0:
+            _ctxs = [r.num_computed_tokens for r in self.running if r.is_prefill_chunk]
+            if _ctxs:
+                pe *= (1.0 + self._slo_ctx_beta * (max(_ctxs) / 8192.0))
+        return pe
+
+    def update_slo_model(self, elapsed_ms, num_ctx_tokens, num_gen_reqs):
+        """Online EMA calibration of the step-time model from observed steps."""
+        if getattr(self, "_slo_static", False):
+            return
+        if elapsed_ms <= 0 or elapsed_ms > 5000:
+            return
+        b = 0.05
+        if num_ctx_tokens == 0 and num_gen_reqs > 0:
+            per = (elapsed_ms - self._slo_base_ms) / (num_gen_reqs ** self._slo_decode_exp)
+            if per > 0:
+                self._slo_dec_per_req = (1 - b) * self._slo_dec_per_req + b * per
+        elif num_ctx_tokens > 0:
+            dec_est = self._slo_decode_est(num_gen_reqs)
+            slope = (elapsed_ms - dec_est) / num_ctx_tokens
+            if slope > 0:
+                self._slo_pref_per_tok = (1 - b) * self._slo_pref_per_tok + b * slope
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -520,6 +704,114 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # SLO cap: when decodes are co-scheduled, bound total prefill tokens this
+        # step so predicted step time stays under the ITL SLO (protects decode ITL).
+        self._slo_prefill_used = 0
+        if self._slo_unified:
+            # UNIFIED controller: ONE cost model, per-class deadlines.
+            if not hasattr(self, "_slo_long_chunk"):
+                self._slo_long_chunk = self._slo_min_prefill
+            _ndec_total = sum(1 for r in self.running if not r.is_prefill_chunk)
+            # chunk-sizing lever: cap prefill ONLY when a TBT-sensitive (streaming)
+            # request is decoding -> protect its TBT; the cap uses TOTAL decoders
+            # (all contribute to step time) via the shared cost model.
+            _nstream_dec = sum(
+                1 for r in self.running
+                if not r.is_prefill_chunk and not self._slo_is_interactive(r)
+            )
+            if _nstream_dec > 0:
+                _decms = self._slo_decode_est(_ndec_total)
+                _cap = (self._slo_safety * self._slo_itl_ms - _decms) / max(self._slo_pref_eff(), 1e-6)
+                self._slo_step_cap = int(max(self._slo_min_prefill, _cap))
+            else:
+                self._slo_step_cap = 1 << 30
+            # admission lever: precount waiting TTFT-sensitive (interactive) reqs so
+            # the waiting loop can prioritize them over streaming prefills (O(1)/iter).
+            self._slo_int_waiting = sum(
+                1 for r in self.waiting if self._slo_is_interactive(r)
+            ) + sum(1 for r in self.skipped_waiting if self._slo_is_interactive(r))
+        elif self._slo_enable:
+            # live-tunable config (no restart): $VLLM_SLO_CFG (default /tmp/slo_cfg) = itl_ms,min_prefill,long_chunk
+            if (self.current_step % 100) == 0:
+                try:
+                    _c = open(os.environ.get("VLLM_SLO_CFG", "/tmp/slo_cfg")).read().split(",")
+                    self._slo_itl_ms = float(_c[0]); self._slo_min_prefill = int(_c[1]); self._slo_long_chunk = int(_c[2])
+                    if len(_c) > 3: self._slo_backlog_max = int(_c[3])
+                    if len(_c) > 4: self._slo_tiers = (int(_c[4]) == 1)
+                    if len(_c) > 5: self._slo_sjf = (int(_c[5]) == 1)
+                    if len(_c) > 6: self._slo_vtc = (int(_c[6]) == 1)
+                    if self._slo_vtc:
+                        try:  # live weights file: "client_key weight" per line
+                            _w = {}
+                            for _ln in open(os.environ.get("VLLM_SLO_VTC_WEIGHTS", "/tmp/vtc_weights")):
+                                _p = _ln.split()
+                                if len(_p) == 2: _w[_p[0]] = float(_p[1])
+                            if _w != self._vtc_weights:
+                                # weights changed (admin op / new measurement config) =>
+                                # reset virtual-time counters to a fresh fair frontier
+                                self._vtc_served.clear()
+                            self._vtc_weights = _w
+                        except Exception:
+                            pass
+                except Exception:
+                    if not hasattr(self, "_slo_long_chunk"): self._slo_long_chunk = self._slo_min_prefill
+            if not hasattr(self, "_slo_long_chunk"): self._slo_long_chunk = self._slo_min_prefill
+            _ndec = sum(1 for r in self.running if not r.is_prefill_chunk)
+            # Two-tier: only clamp when a PREMIUM request is decoding (protect its
+            # ITL). If only bulk decodes are present, run prefill at full throughput.
+            if self._slo_tiers:
+                _nprem = sum(1 for r in self.running if not r.is_prefill_chunk and self._slo_is_premium(r))
+                if _nprem == 0:
+                    _ndec = 0  # no premium to protect -> no cap this step
+            # COMPOSITION-SAFE regime gate: only throttle prefill to hold ITL when an
+            # INTERACTIVE (latency-sensitive) request is present (decoding or waiting).
+            # A pure-batch workload has no ITL SLO to protect -> run prefill at full
+            # throughput (== stock) -> the ITL controller never regresses throughput.
+            if self._slo_itl_int_gate:
+                _has_int = any(self._slo_is_interactive(r) for r in self.running
+                               if not r.is_prefill_chunk) \
+                    or any(self._slo_is_interactive(r) for r in self.waiting) \
+                    or any(self._slo_is_interactive(r) for r in self.skipped_waiting)
+                if not _has_int:
+                    _ndec = 0
+            if _ndec > 0:
+                _decms = self._slo_decode_est(_ndec)
+                _avail = self._slo_safety * self._slo_itl_ms - _decms
+                _cap = _avail / max(self._slo_pref_eff(), 1e-6)
+                self._slo_step_cap = int(max(self._slo_min_prefill, _cap))
+                # Deep-overload guardrail: if the waiting backlog is large, the cap
+                # is starving prefill -> divergent TTFT. Bypass the cap so prefill
+                # progresses (TTFT tracks load, like stock) instead of diverging.
+                if len(self.waiting) > self._slo_backlog_max:
+                    self._slo_step_cap = 1 << 30
+            else:
+                self._slo_step_cap = 1 << 30
+        else:
+            self._slo_step_cap = 1 << 30
+
+        if self._slo_cache_aware:
+            # Per-step prefix sets (built BEFORE the running loop so the pioneer
+            # prefill-throttle exemption sees them): "inflight" = some running req
+            # shares the signature; "primed" = that req has fully prefilled (shared
+            # prefix now cached -> siblings hit); "waiting_sigs" = signatures of
+            # cold LARGE requests still waiting (real siblings to unblock).
+            self._ca_inflight = set()
+            self._ca_primed = set()
+            for r in self.running:
+                s = self._ca_sig(r)
+                if s is None:
+                    continue
+                self._ca_inflight.add(s)
+                if r.num_computed_tokens >= r.num_prompt_tokens:
+                    self._ca_primed.add(s)
+            self._ca_waiting_sigs = set()
+            for r in list(self.waiting) + list(self.skipped_waiting):
+                if (r.num_computed_tokens == 0
+                        and r.num_prompt_tokens >= self._ca_min_prompt):
+                    s = self._ca_sig(r)
+                    if s is not None:
+                        self._ca_waiting_sigs.add(s)
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -565,6 +857,36 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            if (self._slo_enable or self._slo_unified) and request.is_prefill_chunk:
+                _rem = self._slo_step_cap - self._slo_prefill_used
+                if _rem <= 0:
+                    req_index += 1
+                    continue
+                if (self._slo_cache_aware
+                        and self._ca_sig(request) in self._ca_waiting_sigs
+                        and self._ca_sig(request) not in self._ca_primed):
+                    # Cache-aware pioneer WITH waiting siblings: prefill at full step
+                    # budget so the shared prefix caches fast and siblings unblock (as
+                    # hits). Only when siblings actually wait -> no fight with the ITL
+                    # cap for a unique large prompt.
+                    num_new_tokens = min(num_new_tokens, _rem)
+                elif self._slo_unified:
+                    # Class-aware: interactive (TTFT-sensitive) prefills get the FULL
+                    # remaining budget (minimize their TTFT); streaming/bulk prefills
+                    # are throttled to long_chunk to protect co-scheduled TBT.
+                    if self._slo_is_interactive(request):
+                        num_new_tokens = min(num_new_tokens, _rem)
+                    else:
+                        num_new_tokens = min(num_new_tokens, _rem, self._slo_long_chunk)
+                else:
+                    # Throttle LONG in-progress prefills to the min chunk so budget is
+                    # reserved for short/interactive prefills (protects their TTFT).
+                    _is_bulk = self._slo_tiers and not self._slo_is_premium(request)
+                    if _is_bulk:
+                        _cc = self._slo_long_chunk  # deprioritize bulk prefill under premium ITL pressure
+                    else:
+                        _cc = self._slo_long_chunk if request.num_prompt_tokens > self._slo_short_len else _rem
+                    num_new_tokens = min(num_new_tokens, _rem, _cc)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -694,6 +1016,8 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if (self._slo_enable or self._slo_unified) and request.is_prefill_chunk:
+                self._slo_prefill_used += num_new_tokens
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -748,6 +1072,14 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
+            if self._slo_srpt:
+                # shortest max_tokens among currently-waiting requests (SRPT pivot)
+                _mt = [r.max_tokens for r in self.waiting] + [r.max_tokens for r in self.skipped_waiting]
+                self._slo_srpt_min = min(_mt) if _mt else (1 << 30)
+
+            if self._slo_vtc:
+                self._vtc_prepare()
+
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
                     break
@@ -762,6 +1094,90 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # UNIFIED admission: defer a STREAMING (TTFT-insensitive) prefill
+                # while TTFT-sensitive interactive requests are waiting -> interactive
+                # prefills admit first (protect their TTFT). Aging bounds the defer so
+                # streaming prefills never starve. Output-exact (order only).
+                if (self._slo_unified
+                        and request.status == RequestStatus.WAITING
+                        and not self._slo_is_interactive(request)
+                        and self._slo_int_waiting > 0):
+                    _d = getattr(request, "_uni_defers", 0)
+                    if _d < self._slo_sjf_defer_max and len(self.waiting) + len(self.skipped_waiting) > 1:
+                        request._uni_defers = _d + 1
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
+                # SRPT-by-max_tokens: defer a request while a much-shorter-OUTPUT
+                # request is waiting, so short-output jobs admit first -> lower mean
+                # job-completion-time under queueing. Prediction-free (user max_tokens),
+                # output-exact (order only), aging-bounded (no starvation).
+                if (self._slo_srpt
+                        and request.status == RequestStatus.WAITING
+                        and request.max_tokens > self._slo_srpt_mult * self._slo_srpt_min):
+                    _d = getattr(request, "_srpt_defers", 0)
+                    if _d < self._slo_srpt_defer_max and len(self.waiting) + len(self.skipped_waiting) > 1:
+                        request._srpt_defers = _d + 1
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
+                # VTC fair queuing: defer a request whose CLIENT is over-served
+                # (more tokens served) than the least-served waiting client by more
+                # than one quantum -> under-served clients admit first when a slot
+                # frees. Non-preemptive, output-exact (order only). Aging-bounded.
+                if (self._slo_vtc
+                        and request.status == RequestStatus.WAITING
+                        and self._vtc_multi_client):
+                    _ck = self._vtc_client_key(request_id)
+                    if self._vtc_v(_ck) > self._vtc_min + self._vtc_quantum:
+                        _d = getattr(request, "_vtc_defers", 0)
+                        if _d < self._vtc_defer_max:
+                            request._vtc_defers = _d + 1
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+
+                # CACHE-AWARE co-scheduling: if a COLD request shares its prefix
+                # with an in-flight pioneer that hasn't cached the shared prefix
+                # yet, defer it so it becomes a cache HIT instead of redundantly
+                # prefilling the same prefix. The first cold request of a prefix
+                # admits (pioneer) and marks the signature inflight so same-step
+                # siblings defer. Output-exact (order only), aging-bounded.
+                if (self._slo_cache_aware
+                        and request.status == RequestStatus.WAITING
+                        and request.num_computed_tokens == 0
+                        and request.num_prompt_tokens >= self._ca_min_prompt):
+                    _sig = self._ca_sig(request)
+                    if _sig is not None:
+                        if _sig in self._ca_inflight and _sig not in self._ca_primed:
+                            _d = getattr(request, "_ca_defers", 0)
+                            if (_d < self._ca_defer_max
+                                    and len(self.waiting) + len(self.skipped_waiting) > 1):
+                                request._ca_defers = _d + 1
+                                request_queue.pop_request()
+                                step_skipped_waiting.prepend_request(request)
+                                continue
+                        else:
+                            # pioneer (or already primed) -> mark inflight so
+                            # same-step siblings defer behind it. (Prefill-throttle
+                            # exemption is applied dynamically via _ca_waiting_sigs.)
+                            self._ca_inflight.add(_sig)
+
+                # SJF/HOL: defer LARGE prefills (up to defer_max steps) so short
+                # requests jump the queue -> lower short TTFT. Output-exact (only
+                # admission ORDER changes). Aging prevents long-request starvation.
+                if (self._slo_sjf
+                        and request.status == RequestStatus.WAITING
+                        and request.num_prompt_tokens > self._slo_short_len):
+                    _d = getattr(request, "_sjf_defers", 0)
+                    if _d < self._slo_sjf_defer_max and len(self.waiting) + len(self.skipped_waiting) > 1:
+                        request._sjf_defers = _d + 1
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -964,6 +1380,30 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
+                    if self._slo_unified:
+                        _rem = self._slo_step_cap - self._slo_prefill_used
+                        if _rem <= 0:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        if self._slo_is_interactive(request):
+                            num_new_tokens = min(num_new_tokens, _rem)
+                        else:
+                            num_new_tokens = min(num_new_tokens, _rem, self._slo_long_chunk)
+                    elif self._slo_enable:
+                        _rem = self._slo_step_cap - self._slo_prefill_used
+                        if _rem <= 0:
+                            # Budget exhausted: defer, let later steps admit; short
+                            # prefills behind proceed if any budget remains.
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        _is_bulk = self._slo_tiers and not self._slo_is_premium(request)
+                        if _is_bulk:
+                            _cc = self._slo_long_chunk
+                        else:
+                            _cc = self._slo_long_chunk if request.num_prompt_tokens > self._slo_short_len else _rem
+                        num_new_tokens = min(num_new_tokens, _rem, _cc)
                     assert num_new_tokens > 0
 
                     # Apply Mamba alignment before encoder caps.
@@ -1130,6 +1570,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if self._slo_enable or self._slo_unified:
+                    self._slo_prefill_used += num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
@@ -1169,6 +1611,12 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+
+        if self._slo_vtc:
+            # Account tokens SERVED this step to each client's virtual counter.
+            for _rid, _nt in num_scheduled_tokens.items():
+                _ck = self._vtc_client_key(_rid)
+                self._vtc_served[_ck] = self._vtc_served.get(_ck, 0.0) + _nt
 
         assert token_budget >= 0
         assert input_budget >= 0

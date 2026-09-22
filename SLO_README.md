@@ -1,20 +1,36 @@
 # SLO-aware, output-exact serving controls for vLLM
 
 One operator knob — a tail inter-token-latency SLO — that turns idle hardware slack
-into lower latency, fairer sharing, and large energy savings, with **byte-identical
-output** and **zero risk when off**.
+into lower latency, fairer sharing, and large energy savings, **output-exact** (greedy
+output preserved) and with **zero risk when off**.
 
 Base: vLLM `bca7bea2405127bd5291bb6fffa679bdcd8f6dd9`. Measured on one 8×B200 node
 serving `nvidia/GLM-5.2-NVFP4` (TP8 / expert-parallel / fp8 KV).
 
-## Results (matched A/B vs tuned stock vLLM, output-exact, error-barred)
+## Results
 
-| Axis | Result |
+**System-level** — 85-minute true evaluation on 8×B200 serving GLM-5.2-NVFP4,
+matched A/B vs **tuned** stock vLLM (priority scheduling + a long-prefill threshold),
+output-exact, rising arrival-rate sweep:
+
+| Objective | Gain vs tuned stock |
 |---|---|
-| **Energy** | **−34% GPU power** on the real mixed 8192/1024 workload (throughput within ~5%); **+31% tokens/joule at −25% power** on pure-decode load |
-| **Fairness** | **up to 8.7× lower light-client TTFT** under deep-queue contention (2.8× confirmed in-tree), heavy-client throughput neutral |
-| **Latency tail** | **up to ~21× lower decode ITL p99** vs stock's only ITL-bounding knob; **~10–15% median + strong burst-tail protection** vs stock default |
-| **Throughput** | combined always-on config never regresses vs tuned stock (pure-batch 1001 vs 849 tok/s) |
+| p99 decode latency | **2.94× lower** |
+| First-token latency (light client under a heavy one) | **3.61× lower** |
+| GPU power | **21% lower** |
+| Throughput | within 1% (**1.01×**) |
+| Geometric mean over the four | **1.92×** |
+
+**Component-level** — each mechanism measured alone vs tuned stock at fixed arrival
+rates (so these exceed the rising-rate system numbers above):
+
+| Measure | Tuned stock | This PR | Change |
+|---|---|---|---|
+| p99 decode latency, real workload | 141–337 ms | 22–26 ms | **6–13× lower** |
+| Light-client first-token under a heavy client | 9654 ms | 1114 ms | **8.7× lower** |
+| p99 under 8 concurrent long prefills | 221.6–507.7 ms (stock cap) | 24.3 ms | **9–21× lower** |
+| Power at equal throughput (served workload) | — | — | **34% lower** |
+| Tokens/joule (clock 1200 vs 1965, short-prompt) | — | — | **+31%** (−24.9% power, −1.3% tput) |
 
 The controls change only *when* work is admitted and *how large* a prefill chunk
 is — **never token values** — so output matches stock within the accuracy gate

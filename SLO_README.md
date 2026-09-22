@@ -38,6 +38,11 @@ is — **never token values** — so output matches stock within the accuracy ga
 bitwise-reproducible (fp non-associativity), so this is output-exact by
 construction, not a bitwise guarantee.
 
+*Provenance: the component-level table is reproducible from this repo with the
+`benchmarks/slo/*.py` harnesses on the stated hardware. The system-level table
+comes from the benchmark's 85-minute true evaluation (not shipped here); the
+roofline counter figures are from nsys profiling.*
+
 ## The idea
 
 Decode on this model is memory-latency-bound: step time follows a measured roofline
@@ -113,3 +118,21 @@ python benchmarks/slo/roofline.py     # step-ms vs batch M (the cost model)
   (GSM8K + long-context NIAH); like stock vLLM, it is not bitwise-reproducible under
   concurrency (fp non-associativity), so the guarantee is output-exact-by-construction,
   not bit-for-bit.
+
+## Status — cleanup before upstreaming
+
+This is a working research build submitted for discussion, not a merge-ready patch.
+Known items a maintainer should expect:
+
+- **Tests exercise `slo.py` (the reference module), not the inlined scheduler path.**
+  The scheduler carries an equivalent copy with its own constants; either wire it to
+  import `slo.py` or add scheduler-level tests before merge.
+- **Live-config hook reads `/tmp/slo_cfg` (world-writable) every 100 steps.** A
+  convenience for the research runs; should be removed or replaced for upstream.
+- **`client_key` differs between the scheduler and `slo.py`** (first vs last `-`);
+  agrees only for single-segment client ids.
+- **The DVFS governor is a host-side tool** requiring NVML/clock permissions; it only
+  restores clocks on SIGINT (a SIGTERM handler should be added), and its
+  `windowed_p99` histogram estimator needs a de-cumulation fix.
+- **The ITL cap is best-effort:** when the decode batch alone exceeds the SLO it floors
+  the prefill chunk at `min_prefill` rather than strictly enforcing the bound.
